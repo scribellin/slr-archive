@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Story Archive</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,500;6..72,700&family=Space+Grotesk:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="bg-orb orb-a"></div>
+    <div class="bg-orb orb-b"></div>
+    <main class="shell">
+      <header class="hero">
+        <p class="kicker">Weekly Newsletter Archive</p>
+        <h1>Find Any Story You’ve Shared</h1>
+        <p class="lede">
+          One searchable hub for every recommendation across issues.
+        </p>
+      </header>
+
+      <section class="controls" aria-label="Search controls">
+        <label class="search-wrap">
+          <span class="sr-only">Search stories</span>
+          <input
+            id="searchInput"
+            type="search"
+            placeholder="Search headline, outlet, writer, topic..."
+            autocomplete="off"
+          />
+        </label>
+
+        <div class="filters">
+          <label>
+            <span>Issue year</span>
+            <select id="yearFilter">
+              <option value="">All years</option>
+            </select>
+          </label>
+
+          <label>
+            <span>Topic</span>
+            <select id="topicFilter">
+              <option value="">All topics</option>
+            </select>
+          </label>
+
+          <label>
+            <span>Sort</span>
+            <select id="sortSelect">
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+              <option value="title">Title (A-Z)</option>
+            </select>
+          </label>
+        </div>
+      </section>
+
+      <section class="meta-row">
+        <p id="resultCount">Loading stories...</p>
+      </section>
+
+      <section id="results" class="results" aria-live="polite"></section>
+    </main>
+
+    <template id="storyCardTemplate">
+      <article class="card">
+        <div class="card-top">
+          <p class="issue"></p>
+          <p class="date"></p>
+        </div>
+        <h2 class="title"></h2>
+        <p class="publication"></p>
+        <p class="summary"></p>
+        <div class="tag-row"></div>
+        <a class="link" target="_blank" rel="noopener noreferrer">Read story</a>
+      </article>
+    </template>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>
