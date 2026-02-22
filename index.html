@@ -51,6 +51,14 @@
           </label>
 
           <label>
+            <span>Picks</span>
+            <select id="favoriteFilter">
+              <option value="">All picks</option>
+              <option value="favorites">Favorites only</option>
+            </select>
+          </label>
+
+          <label>
             <span>Sort</span>
             <select id="sortSelect">
               <option value="newest">Newest first</option>
@@ -63,6 +71,14 @@
 
       <section class="meta-row">
         <p id="resultCount">Loading stories...</p>
+      </section>
+
+      <section id="favoriteBoxesSection" class="favorite-boxes-section" hidden>
+        <div class="favorite-boxes-head">
+          <h2>Favorite Picks</h2>
+          <p>Hand-picked selections from Don/Jacob sections.</p>
+        </div>
+        <div id="favoriteBoxes" class="favorite-boxes"></div>
       </section>
 
       <section id="results" class="results" aria-live="polite"></section>

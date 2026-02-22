@@ -7,8 +7,11 @@ const els = {
   searchInput: document.getElementById("searchInput"),
   yearFilter: document.getElementById("yearFilter"),
   topicFilter: document.getElementById("topicFilter"),
+  favoriteFilter: document.getElementById("favoriteFilter"),
   sortSelect: document.getElementById("sortSelect"),
   resultCount: document.getElementById("resultCount"),
+  favoriteBoxesSection: document.getElementById("favoriteBoxesSection"),
+  favoriteBoxes: document.getElementById("favoriteBoxes"),
   results: document.getElementById("results"),
   template: document.getElementById("storyCardTemplate")
 };
@@ -37,6 +40,7 @@ async function initialize() {
     filterAndRender();
   } catch (error) {
     els.resultCount.textContent = "Could not load stories.json.";
+    els.favoriteBoxesSection.hidden = true;
     els.results.innerHTML = `<p class="empty-state">${error.message}</p>`;
   }
 }
@@ -51,6 +55,9 @@ function normalizeStories(stories) {
       writer: String(story.writer || "").trim(),
       topic: String(story.topic || "General").trim(),
       summary: sanitizeSummary(String(story.summary || "").trim()),
+      isFavorite: Boolean(story.isFavorite),
+      favoriteBy: String(story.favoriteBy || "").trim(),
+      package: String(story.package || "").trim(),
       issueTitle: String(story.issueTitle || "").trim(),
       url: String(story.url || "").trim(),
       issueUrl: String(story.issueUrl || "").trim(),
@@ -86,7 +93,7 @@ function populateFilters(stories) {
 }
 
 function bindEvents() {
-  [els.searchInput, els.yearFilter, els.topicFilter, els.sortSelect].forEach((el) => {
+  [els.searchInput, els.yearFilter, els.topicFilter, els.favoriteFilter, els.sortSelect].forEach((el) => {
     el.addEventListener("input", filterAndRender);
     el.addEventListener("change", filterAndRender);
   });
@@ -96,6 +103,7 @@ function filterAndRender() {
   const searchValue = els.searchInput.value.trim().toLowerCase();
   const yearValue = els.yearFilter.value;
   const topicValue = els.topicFilter.value;
+  const favoriteValue = els.favoriteFilter.value;
   const sortValue = els.sortSelect.value;
 
   const filtered = state.stories.filter((story) => {
@@ -107,7 +115,10 @@ function filterAndRender() {
         story.writer,
         story.topic,
         story.summary,
-        story.issueTitle
+        story.issueTitle,
+        story.favoriteBy,
+        story.package,
+        story.isFavorite ? "favorite" : ""
       ]
         .join(" ")
         .toLowerCase()
@@ -115,11 +126,13 @@ function filterAndRender() {
 
     const matchesYear = !yearValue || story.issueDate.getFullYear() === Number(yearValue);
     const matchesTopic = !topicValue || story.topic === topicValue;
+    const matchesFavorite = favoriteValue !== "favorites" || story.isFavorite;
 
-    return matchesSearch && matchesYear && matchesTopic;
+    return matchesSearch && matchesYear && matchesTopic && matchesFavorite;
   });
 
   state.filtered = sortStories(filtered, sortValue);
+  renderFavoriteBoxes(state.filtered);
   renderResults(state.filtered);
 }
 
@@ -187,10 +200,68 @@ function renderResults(stories) {
       tagRow.append(tag);
     }
 
+    if (story.package) {
+      const packageTag = document.createElement("span");
+      packageTag.className = "tag package-tag";
+      packageTag.textContent = story.package;
+      tagRow.append(packageTag);
+    }
+
+    if (story.isFavorite) {
+      const favoriteTag = document.createElement("span");
+      favoriteTag.className = "tag favorite-tag";
+      favoriteTag.textContent = story.favoriteBy
+        ? `Favorite: ${story.favoriteBy}`
+        : "Favorite";
+      tagRow.append(favoriteTag);
+    }
+
     fragment.append(node);
   });
 
   els.results.replaceChildren(fragment);
+}
+
+function renderFavoriteBoxes(stories) {
+  const favorites = stories.filter((story) => story.isFavorite);
+  if (favorites.length === 0) {
+    els.favoriteBoxesSection.hidden = true;
+    els.favoriteBoxes.replaceChildren();
+    return;
+  }
+
+  const featured = [...favorites]
+    .sort((a, b) => b.issueDate - a.issueDate)
+    .slice(0, 8);
+
+  const fragment = document.createDocumentFragment();
+  featured.forEach((story) => {
+    const card = document.createElement("a");
+    card.className = "favorite-box";
+    card.href = story.url || story.issueUrl || "#";
+    card.target = "_blank";
+    card.rel = "noopener noreferrer";
+
+    const byline = document.createElement("p");
+    byline.className = "favorite-byline";
+    byline.textContent = story.favoriteBy
+      ? `Favorite pick by ${story.favoriteBy}`
+      : "Favorite pick";
+
+    const title = document.createElement("p");
+    title.className = "favorite-title";
+    title.textContent = story.headline;
+
+    const meta = document.createElement("p");
+    meta.className = "favorite-meta";
+    meta.textContent = [formatDate(story.issueDate), story.outlet].filter(Boolean).join(" · ");
+
+    card.append(byline, title, meta);
+    fragment.append(card);
+  });
+
+  els.favoriteBoxes.replaceChildren(fragment);
+  els.favoriteBoxesSection.hidden = false;
 }
 
 function sanitizeSummary(summary) {

@@ -12,6 +12,8 @@ Each story record includes:
 - `topic` (inferred)
 - `summary` (one sentence)
 - `leadImage` (when available)
+- `isFavorite` and `favoriteBy` (when a story appears in favorite-pick sections)
+- `package` (for grouped sections like `SLR Syllabus` / `The Locals`)
 - `url`
 - `issueDate`, `issueTitle`, `issueUrl`
 
@@ -42,6 +44,7 @@ Notes:
 - With `--lead-image-source article`, the script fetches each story page and uses metadata (`og:image` / `twitter:image`) for `leadImage`.
 - Article-image lookups are cached to `.cache/article-image-cache.json` (or under `--cache-dir`) so future runs are much faster.
 - If you want to skip article-image lookups and keep newsletter images, use `--lead-image-source newsletter`.
+- Sponsored blocks, staff-curator blocks, and "last week's most reads" repeats are excluded.
 - Old templates vary a lot, so extraction quality is best from mid-2016 onward.
 
 ## Publish permanently with GitHub Pages

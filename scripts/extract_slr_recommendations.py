@@ -110,6 +110,10 @@ ARTICLE_IMAGE_META_KEYS = (
     "image",
 )
 
+EXCLUDED_HEADLINES = {
+    "read more books",
+}
+
 
 @dataclass
 class Issue:
@@ -161,6 +165,122 @@ def looks_like_summary_noise(text: str) -> bool:
     if "non-paywalled link created for sunday long read subscribers" in lower:
         return True
     if "listen to" in lower and "podcast" in lower:
+        return True
+    return False
+
+
+def detect_favorite_owner(text: str) -> str:
+    key = normalize_compare_key(text)
+    if not key:
+        return ""
+    if "don and jacob" in key and "favorite" in key:
+        return "Don & Jacob"
+    if "jacob and don" in key and "favorite" in key:
+        return "Don & Jacob"
+    if "don s favorite" in key or "dvn s favorite" in key:
+        return "Don"
+    if "jacob s favorite" in key:
+        return "Jacob"
+    return ""
+
+
+def is_repeat_section_heading(text: str) -> bool:
+    key = normalize_compare_key(text)
+    if not key:
+        return False
+    if len(key.split()) > 12:
+        return False
+    if key.startswith("last week s most reads"):
+        return True
+    if key.startswith("last weeks most reads"):
+        return True
+    if key.startswith("last week s most clicked"):
+        return True
+    if key.startswith("last weeks most clicked"):
+        return True
+    if key in {"most read last week", "most clicked last week"}:
+        return True
+    return False
+
+
+def detect_package_marker(text: str) -> tuple[str, tuple[str, ...]]:
+    key = normalize_compare_key(text)
+    if not key:
+        return "", ()
+    if "slr syllabus" in key:
+        cleaned = re.sub(r"\s+", " ", text).strip(" :")
+        return cleaned or "SLR Syllabus", ()
+    if "the locals" in key:
+        return "The Locals", ()
+    if "epstein" in key and "pieces worth your time" in key:
+        return "SLR Syllabus: Epstein Files", ("epstein",)
+    if "pieces in this syllabus" in key and "epstein" in key:
+        return "SLR Syllabus: Epstein Files", ("epstein",)
+    return "", ()
+
+
+def detect_favorite_bio_owner(text: str) -> str:
+    key = normalize_compare_key(text)
+    if key.startswith("don van natta jr") and "pulitzer" in key:
+        return "Don"
+    if key.startswith("jacob feldman") and ("sportico" in key or "sports illustrated" in key):
+        return "Jacob"
+    return ""
+
+
+def infer_favorites_from_bios(headings: list[dict[str, str]]) -> dict[int, str]:
+    bio_markers: list[tuple[int, str]] = []
+    for idx, heading in enumerate(headings):
+        owner = detect_favorite_bio_owner(heading["text"])
+        if owner and idx < 70:
+            bio_markers.append((idx, owner))
+    if not bio_markers:
+        return {}
+
+    story_indices = [
+        idx
+        for idx, heading in enumerate(headings)
+        if heading["level"] == "1" and looks_like_story_title(normalize_headline(heading["text"]))
+    ]
+    favorites: dict[int, str] = {}
+    previous_marker = -1
+    for marker_idx, owner in bio_markers:
+        between = [story_idx for story_idx in story_indices if previous_marker < story_idx < marker_idx]
+        if 1 <= len(between) <= 3:
+            for story_idx in between:
+                favorites[story_idx] = owner
+        previous_marker = marker_idx
+    return favorites
+
+
+def should_exclude_item(
+    headline: str,
+    outlet: str,
+    summary: str,
+    url: str,
+    exclude_repeats: bool,
+    exclude_curators: bool,
+) -> bool:
+    if exclude_repeats:
+        return True
+    if exclude_curators:
+        return True
+    headline_key = normalize_compare_key(headline)
+    summary_key = normalize_compare_key(summary)
+    outlet_key = normalize_compare_key(outlet)
+    url_lower = url.lower().strip()
+
+    if headline_key in EXCLUDED_HEADLINES:
+        return True
+    if "sponsored" in headline_key or "sponsored" in summary_key:
+        return True
+    if "staff curators" in summary_key or "staff curators" in headline_key:
+        return True
+    if "curators" in summary_key and "classics" in summary_key and "photos" in summary_key:
+        return True
+    if "beehiiv" in url_lower and headline_key.startswith("read more"):
+        return True
+    if outlet_key == "beehiiv" and headline_key.startswith("read more"):
         return True
     return False
 
@@ -688,6 +808,67 @@ def parse_inline_story_line(text: str) -> tuple[str, str, str]:
     return title, writer, outlet
 
 
+def heading_is_story_marker(heading: dict[str, str]) -> bool:
+    text = heading["text"]
+    if heading["level"] == "1" and looks_like_story_title(normalize_headline(text)):
+        return True
+    title, writer, outlet = parse_inline_story_line(text)
+    return bool(title and (writer or outlet))
+
+
+def is_curator_section_heading(text: str) -> bool:
+    key = normalize_compare_key(text)
+    if not key:
+        return False
+    if "staff curators" in key:
+        return True
+    if "last week we sent out a member s only edition" in key:
+        return True
+    return False
+
+
+def section_context_for_index(headings: list[dict[str, str]], idx: int) -> tuple[str, bool, bool, str]:
+    favorite_by = ""
+    exclude_repeats = False
+    exclude_curators = False
+    package = ""
+    package_keywords: tuple[str, ...] = ()
+    package_marker_idx = -1
+
+    for j in range(idx - 1, -1, -1):
+        text = headings[j]["text"]
+        if not favorite_by:
+            favorite_by = detect_favorite_owner(text)
+
+        if is_repeat_section_heading(text):
+            exclude_repeats = True
+        if is_curator_section_heading(text):
+            exclude_curators = True
+
+        if not package:
+            marker, keywords = detect_package_marker(text)
+            if marker:
+                package = marker
+                package_keywords = keywords
+                package_marker_idx = j
+
+        if heading_is_story_marker(headings[j]) and favorite_by:
+            break
+
+    if package and package_keywords:
+        haystack = f"{headings[idx]['text']}".lower()
+        if not any(keyword in haystack for keyword in package_keywords):
+            package = ""
+    elif package and package_marker_idx >= 0:
+        story_markers_between = 0
+        for k in range(package_marker_idx + 1, idx):
+            if heading_is_story_marker(headings[k]):
+                story_markers_between += 1
+        if story_markers_between > 4:
+            package = ""
+    return favorite_by, exclude_repeats, exclude_curators, package
+
+
 def passes_quality_checks(headline: str, outlet: str, writer: str, summary: str) -> bool:
     if not looks_like_story_title(headline):
         return False
@@ -786,6 +967,7 @@ def outlet_from_url(url: str) -> str:
 def extract_recommendations(issue: Issue, html_text: str) -> list[dict[str, str]]:
     headings = parse_headings(html_text)
     images = parse_images(html_text)
+    favorite_overrides = infer_favorites_from_bios(headings)
     items: list[dict[str, str]] = []
     seen_keys: set[tuple[str, str, str, str]] = set()
 
@@ -797,6 +979,10 @@ def extract_recommendations(issue: Issue, html_text: str) -> list[dict[str, str]
         story_url: str,
         source: str,
         lead_image: str = "",
+        favorite_by: str = "",
+        exclude_repeats: bool = False,
+        exclude_curators: bool = False,
+        package: str = "",
     ) -> None:
         headline = normalize_headline(headline)
         writer = writer.strip()
@@ -804,6 +990,8 @@ def extract_recommendations(issue: Issue, html_text: str) -> list[dict[str, str]
         summary = first_sentence(summary)
         if not outlet:
             outlet = outlet_from_url(story_url)
+        if should_exclude_item(headline, outlet, summary, story_url, exclude_repeats, exclude_curators):
+            return
         if not passes_quality_checks(headline, outlet, writer, summary):
             return
         topic = infer_topic(headline, outlet, summary)
@@ -823,6 +1011,9 @@ def extract_recommendations(issue: Issue, html_text: str) -> list[dict[str, str]
                 "summary": summary,
                 "url": story_url or issue.url,
                 "leadImage": lead_image,
+                "isFavorite": bool(favorite_by),
+                "favoriteBy": favorite_by,
+                "package": package,
                 "sourceFormat": source,
             }
         )
@@ -838,6 +1029,9 @@ def extract_recommendations(issue: Issue, html_text: str) -> list[dict[str, str]
         writer = ""
         outlet = ""
         summary = ""
+        favorite_by, exclude_repeats, exclude_curators, package = section_context_for_index(headings, i)
+        if not favorite_by:
+            favorite_by = favorite_overrides.get(i, "")
 
         # Sometimes the h1 itself contains ", by ..."
         by_in_title = re.search(r",\s*by\s+(.+)$", title, flags=re.IGNORECASE)
@@ -876,7 +1070,19 @@ def extract_recommendations(issue: Issue, html_text: str) -> list[dict[str, str]
         previous_start = int(headings[previous_h1]["start"]) if previous_h1 >= 0 else 0
         lead_image = choose_story_image(images, previous_start, int(h["start"]))
 
-        add_item(title, writer, outlet, summary, story_url, "h1-sequence", lead_image)
+        add_item(
+            title,
+            writer,
+            outlet,
+            summary,
+            story_url,
+            "h1-sequence",
+            lead_image,
+            favorite_by,
+            exclude_repeats,
+            exclude_curators,
+            package,
+        )
 
     # Older template pass: one line often contains title + byline + source.
     for i, h in enumerate(headings):
@@ -888,13 +1094,28 @@ def extract_recommendations(issue: Issue, html_text: str) -> list[dict[str, str]
             continue
         story_url = choose_link(h["raw"])
         summary = ""
+        favorite_by, exclude_repeats, exclude_curators, package = section_context_for_index(headings, i)
+        if not favorite_by:
+            favorite_by = favorite_overrides.get(i, "")
         minute_split = re.split(r"\(~?\d+.*?\)\s*", text, maxsplit=1)
         if len(minute_split) == 2 and minute_split[1].strip():
             summary = minute_split[1].strip()
         if not summary:
             next_h1 = next((idx for idx in range(i + 1, len(headings)) if headings[idx]["level"] == "1"), len(headings))
             summary = summary_from_nearby(headings, i + 1, next_h1)
-        add_item(title, writer, outlet, summary, story_url, "inline-byline")
+        add_item(
+            title,
+            writer,
+            outlet,
+            summary,
+            story_url,
+            "inline-byline",
+            "",
+            favorite_by,
+            exclude_repeats,
+            exclude_curators,
+            package,
+        )
 
     # Legacy template fallback for early issues using numbered plain-text blocks.
     if len(items) < 8:
@@ -906,6 +1127,10 @@ def extract_recommendations(issue: Issue, html_text: str) -> list[dict[str, str]
                 legacy["summary"],
                 legacy["url"],
                 "legacy-numbered",
+                "",
+                "",
+                False,
+                False,
                 "",
             )
 
