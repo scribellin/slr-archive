@@ -50,10 +50,11 @@ function normalizeStories(stories) {
       outlet: String(story.outlet || "").trim(),
       writer: String(story.writer || "").trim(),
       topic: String(story.topic || "General").trim(),
-      summary: String(story.summary || "").trim(),
+      summary: sanitizeSummary(String(story.summary || "").trim()),
       issueTitle: String(story.issueTitle || "").trim(),
       url: String(story.url || "").trim(),
-      issueUrl: String(story.issueUrl || "").trim()
+      issueUrl: String(story.issueUrl || "").trim(),
+      leadImage: normalizeAssetUrl(String(story.leadImage || "").trim())
     }))
     .filter(
       (story) =>
@@ -151,8 +152,8 @@ function renderResults(stories) {
   const fragment = document.createDocumentFragment();
   stories.forEach((story, index) => {
     const node = els.template.content.cloneNode(true);
-    const issue = node.querySelector(".issue");
     const date = node.querySelector(".date");
+    const leadImage = node.querySelector(".lead-image");
     const title = node.querySelector(".title");
     const publication = node.querySelector(".publication");
     const summary = node.querySelector(".summary");
@@ -160,14 +161,21 @@ function renderResults(stories) {
     const link = node.querySelector(".link");
     const card = node.querySelector(".card");
 
-    issue.textContent = story.issueTitle || "Newsletter issue";
     date.textContent = formatDate(story.issueDate);
     title.textContent = story.headline;
+
+    if (story.leadImage) {
+      leadImage.src = story.leadImage;
+      leadImage.alt = `Lead image for ${story.headline}`;
+      leadImage.hidden = false;
+    } else {
+      leadImage.hidden = true;
+    }
 
     const bylineParts = [story.outlet, story.writer].filter(Boolean);
     publication.textContent = bylineParts.join(" · ") || "Unknown outlet";
 
-    summary.textContent = story.summary || "No summary yet.";
+    summary.textContent = story.summary || "Description unavailable.";
     link.href = story.url || story.issueUrl || "#";
 
     card.style.animationDelay = `${Math.min(index * 35, 280)}ms`;
@@ -183,6 +191,27 @@ function renderResults(stories) {
   });
 
   els.results.replaceChildren(fragment);
+}
+
+function sanitizeSummary(summary) {
+  const cleaned = summary.replace(/\s+/g, " ").trim();
+  if (!cleaned) {
+    return "";
+  }
+  if (cleaned.toLowerCase().startsWith("recommended in the sunday long read")) {
+    return "";
+  }
+  return cleaned;
+}
+
+function normalizeAssetUrl(url) {
+  if (!url) {
+    return "";
+  }
+  if (url.startsWith("http://")) {
+    return `https://${url.slice(7)}`;
+  }
+  return url;
 }
 
 function formatDate(date) {

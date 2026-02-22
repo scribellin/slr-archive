@@ -11,6 +11,7 @@ Each story record includes:
 - `writer`
 - `topic` (inferred)
 - `summary` (one sentence)
+- `leadImage` (when available)
 - `url`
 - `issueDate`, `issueTitle`, `issueUrl`
 
@@ -30,13 +31,17 @@ Then open [http://localhost:8000](http://localhost:8000).
 python3 scripts/extract_slr_recommendations.py \
   --docx "/Users/jacobfeldman/Downloads/full slr archive.docx" \
   --output "stories.json" \
-  --cache-dir "/tmp/slr-archive-cache"
+  --cache-dir "/tmp/slr-archive-cache" \
+  --lead-image-source article
 ```
 
 Notes:
 
 - First run downloads all linked issues and may take several minutes.
 - Re-runs are fast because HTML is cached.
+- With `--lead-image-source article`, the script fetches each story page and uses metadata (`og:image` / `twitter:image`) for `leadImage`.
+- Article-image lookups are cached to `.cache/article-image-cache.json` (or under `--cache-dir`) so future runs are much faster.
+- If you want to skip article-image lookups and keep newsletter images, use `--lead-image-source newsletter`.
 - Old templates vary a lot, so extraction quality is best from mid-2016 onward.
 
 ## Publish permanently with GitHub Pages

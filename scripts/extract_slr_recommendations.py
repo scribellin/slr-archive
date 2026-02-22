@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import html
 import json
 import re
@@ -13,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
@@ -39,8 +40,6 @@ NOISE_FRAGMENTS = (
     "view web version",
     "email us",
     "follow us",
-    "members",
-    "staff ",
     "enjoy the best longform journalism",
     "how you can support",
     "issue #",
@@ -102,6 +101,15 @@ TOPIC_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("International", ("ukraine", "china", "russia", "gaza", "israel", "europe", "africa", "global")),
 ]
 
+ARTICLE_IMAGE_META_KEYS = (
+    "og:image",
+    "og:image:url",
+    "og:image:secure_url",
+    "twitter:image",
+    "twitter:image:src",
+    "image",
+)
+
 
 @dataclass
 class Issue:
@@ -114,6 +122,16 @@ def clean_text(raw: str) -> str:
     no_tags = re.sub(r"<[^>]+>", " ", raw)
     decoded = html.unescape(no_tags).replace("\xa0", " ")
     return " ".join(decoded.split()).strip()
+
+
+def dedupe_repeated_phrase(text: str) -> str:
+    candidate = text.strip()
+    while candidate:
+        match = re.match(r"^(?P<phrase>.+?)\s+\1$", candidate)
+        if not match:
+            return candidate
+        candidate = match.group("phrase").strip()
+    return text.strip()
 
 
 def first_sentence(text: str) -> str:
@@ -130,6 +148,21 @@ def looks_like_noise(text: str) -> bool:
     if not text or len(text) < 6:
         return True
     return any(fragment in lower for fragment in NOISE_FRAGMENTS)
+
+
+def looks_like_summary_noise(text: str) -> bool:
+    lower = text.lower().strip()
+    if looks_like_noise(text):
+        return True
+    if lower.startswith(">"):
+        return True
+    if "free for slr readers" in lower:
+        return True
+    if "non-paywalled link created for sunday long read subscribers" in lower:
+        return True
+    if "listen to" in lower and "podcast" in lower:
+        return True
+    return False
 
 
 def normalize_headline(text: str) -> str:
@@ -216,12 +249,15 @@ def parse_docx_issues(docx_path: Path) -> list[Issue]:
         url = rel_map.get(rid, "")
         if "campaign-archive.com/?u=" not in url:
             continue
-        merged = clean_text(f"{text} {link_text}")
+        merged = clean_text(text)
+        if link_text and normalize_compare_key(link_text) not in normalize_compare_key(merged):
+            merged = clean_text(f"{merged} {link_text}")
         date_match = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", merged)
         if not date_match:
             continue
         date = datetime.strptime(date_match.group(1), "%m/%d/%Y").strftime("%Y-%m-%d")
         title = re.sub(r"^\d{2}/\d{2}/\d{4}\s*-\s*", "", merged).strip()
+        title = dedupe_repeated_phrase(title)
         issues.append(Issue(date=date, title=title, url=url))
 
     # Preserve source order and remove exact duplicate issue URLs.
@@ -252,6 +288,146 @@ def fetch_issue_html(url: str, cache_dir: Path | None) -> str:
     return html_text
 
 
+def canonical_story_url(url: str) -> str:
+    parsed = urlparse(url.strip())
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return urlunparse(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path or "/",
+            "",
+            "",
+            "",
+        )
+    )
+
+
+def parse_meta_attributes(tag: str) -> dict[str, str]:
+    attrs: dict[str, str] = {}
+    for name, value in re.findall(
+        r"""([a-zA-Z_:.-]+)\s*=\s*(".*?"|'.*?'|[^\s>]+)""",
+        tag,
+        flags=re.DOTALL,
+    ):
+        value = value.strip().strip("'\"")
+        attrs[name.lower()] = html.unescape(value).strip()
+    return attrs
+
+
+def normalize_image_url(raw_url: str, page_url: str) -> str:
+    if not raw_url:
+        return ""
+    candidate = html.unescape(raw_url).strip()
+    if not candidate:
+        return ""
+    if candidate.startswith("data:image/"):
+        return ""
+    normalized = urljoin(page_url, candidate)
+    parsed = urlparse(normalized)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+    return normalized
+
+
+def extract_article_image(html_text: str, page_url: str) -> str:
+    for match in re.finditer(r"<meta\b[^>]*>", html_text, flags=re.IGNORECASE):
+        attrs = parse_meta_attributes(match.group(0))
+        key = attrs.get("property") or attrs.get("name") or attrs.get("itemprop") or ""
+        if key.lower() not in ARTICLE_IMAGE_META_KEYS:
+            continue
+        image = normalize_image_url(attrs.get("content", ""), page_url)
+        if image:
+            return image
+    return ""
+
+
+def fetch_article_image(url: str, timeout: float = 12.0, max_bytes: int = 800_000) -> str:
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        },
+    )
+    try:
+        with urlopen(req, timeout=timeout) as response:
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if content_type.startswith("image/"):
+                return url
+            payload = response.read(max_bytes)
+            encoding = response.headers.get_content_charset() or "utf-8"
+    except Exception:  # noqa: BLE001
+        return ""
+
+    html_text = payload.decode(encoding, errors="ignore")
+    return extract_article_image(html_text, url)
+
+
+def load_article_image_cache(cache_file: Path) -> dict[str, str]:
+    if not cache_file.exists():
+        return {}
+    try:
+        data = json.loads(cache_file.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    if isinstance(data, dict):
+        return {str(k): str(v) for k, v in data.items()}
+    return {}
+
+
+def save_article_image_cache(cache_file: Path, cache: dict[str, str]) -> None:
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def enrich_with_article_images(
+    items: list[dict[str, str]],
+    cache_file: Path,
+    workers: int = 12,
+    timeout: float = 12.0,
+) -> tuple[int, int]:
+    cache = load_article_image_cache(cache_file)
+    canonical_to_url: dict[str, str] = {}
+    for item in items:
+        story_url = str(item.get("url", "")).strip()
+        if not valid_story_url(story_url):
+            continue
+        canonical = canonical_story_url(story_url)
+        if canonical and canonical not in canonical_to_url:
+            canonical_to_url[canonical] = story_url
+
+    pending = [key for key in canonical_to_url if key not in cache]
+    if pending:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            future_map = {
+                pool.submit(fetch_article_image, canonical_to_url[key], timeout): key
+                for key in pending
+            }
+            completed = 0
+            for future in as_completed(future_map):
+                key = future_map[future]
+                try:
+                    cache[key] = future.result() or ""
+                except Exception:  # noqa: BLE001
+                    cache[key] = ""
+                completed += 1
+                if completed % 200 == 0:
+                    print(f"Article image lookup: {completed}/{len(pending)}")
+        save_article_image_cache(cache_file, cache)
+
+    with_image = 0
+    for item in items:
+        story_url = str(item.get("url", "")).strip()
+        canonical = canonical_story_url(story_url)
+        image = cache.get(canonical, "") if canonical else ""
+        item["leadImage"] = image
+        if image:
+            with_image += 1
+    return with_image, len(canonical_to_url)
+
+
 def parse_headings(html_text: str) -> list[dict[str, str]]:
     headings: list[dict[str, str]] = []
     for match in re.finditer(r"<h([1-4])[^>]*>(.*?)</h\1>", html_text, flags=re.IGNORECASE | re.DOTALL):
@@ -259,7 +435,15 @@ def parse_headings(html_text: str) -> list[dict[str, str]]:
         raw = match.group(2)
         text = clean_text(raw)
         if text:
-            headings.append({"level": str(level), "raw": raw, "text": text})
+            headings.append(
+                {
+                    "level": str(level),
+                    "raw": raw,
+                    "text": text,
+                    "start": str(match.start()),
+                    "end": str(match.end()),
+                }
+            )
     return headings
 
 
@@ -296,6 +480,71 @@ def match_anchor_url(title: str, anchors: list[dict[str, str]]) -> str:
             if key in anchor["key"] or anchor["key"] in key:
                 return anchor["href"]
     return ""
+
+
+def parse_images(html_text: str) -> list[dict[str, str]]:
+    images: list[dict[str, str]] = []
+    for match in re.finditer(r"<img\b[^>]*>", html_text, flags=re.IGNORECASE):
+        raw = match.group(0)
+        src_match = re.search(r"""src=["']([^"']+)["']""", raw, flags=re.IGNORECASE)
+        if not src_match:
+            continue
+        src = html.unescape(src_match.group(1)).strip()
+        if not src:
+            continue
+        width_match = re.search(r"""width=["']?(\d+)["']?""", raw, flags=re.IGNORECASE)
+        height_match = re.search(r"""height=["']?(\d+)["']?""", raw, flags=re.IGNORECASE)
+        width = int(width_match.group(1)) if width_match else 0
+        height = int(height_match.group(1)) if height_match else 0
+        images.append(
+            {
+                "src": src,
+                "start": str(match.start()),
+                "end": str(match.end()),
+                "width": str(width),
+                "height": str(height),
+            }
+        )
+    return images
+
+
+def is_story_image(src: str, width: int, height: int) -> bool:
+    lower = src.lower()
+    blocked = (
+        "cdn-images.mailchimp.com/icons/",
+        "google.com/s2/favicons",
+        "intuit-mc-rewards",
+        "social-block-v2",
+        "mailchimp.com",
+        "monkey_rewards",
+        "acc795a1-25b3-424b-83a7-c4676f26fd45",
+    )
+    if any(token in lower for token in blocked):
+        return False
+    if lower.startswith("data:image/"):
+        return False
+    if width and width < 180:
+        return False
+    if height and height < 120:
+        return False
+    return True
+
+
+def choose_story_image(images: list[dict[str, str]], previous_start: int, story_start: int) -> str:
+    candidates: list[dict[str, str]] = []
+    for image in images:
+        pos = int(image["start"])
+        if pos <= previous_start or pos >= story_start:
+            continue
+        src = image["src"]
+        width = int(image["width"])
+        height = int(image["height"])
+        if not is_story_image(src, width, height):
+            continue
+        candidates.append(image)
+    if not candidates:
+        return ""
+    return candidates[-1]["src"]
 
 
 def html_text_lines(html_text: str) -> list[str]:
@@ -458,18 +707,67 @@ def passes_quality_checks(headline: str, outlet: str, writer: str, summary: str)
     return True
 
 
-def summary_from_nearby(headings: list[dict[str, str]], start: int) -> str:
-    for j in range(start, min(start + 5, len(headings))):
+def summary_from_nearby(headings: list[dict[str, str]], start: int, stop: int) -> str:
+    for j in range(start, min(stop, len(headings))):
         text = headings[j]["text"]
+        level = headings[j]["level"]
+        if level not in {"3", "4"}:
+            continue
         lower = text.lower()
-        if looks_like_noise(text):
+        if looks_like_summary_noise(text):
             continue
         if BYLINE_RE.match(text):
+            continue
+        if re.match(r"^~?\d+\s*(minutes?|mins?)$", lower):
+            continue
+        if len(text) < 45:
             continue
         if " by " in lower and " for " in lower and len(text) < 180:
             continue
         sentence = first_sentence(text)
-        if sentence and len(sentence) >= 40:
+        if sentence and 40 <= len(sentence) <= 340:
+            return sentence
+    return ""
+
+
+def summary_from_block(block_html: str, headline: str) -> str:
+    cleaned = re.sub(r"(?is)<script.*?</script>", " ", block_html)
+    cleaned = re.sub(r"(?is)<style.*?</style>", " ", cleaned)
+    cleaned = re.sub(r"(?is)<!--.*?-->", " ", cleaned)
+    cleaned = re.sub(r"(?i)<br\\s*/?>", "\n", cleaned)
+    cleaned = re.sub(r"(?i)</(p|div|h[1-6]|li|tr|td|blockquote)>", "\n", cleaned)
+    cleaned = re.sub(r"(?i)<(p|div|h[1-6]|li|tr|td|blockquote)[^>]*>", "", cleaned)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    lines = [clean_text(line) for line in cleaned.splitlines()]
+    headline_key = normalize_compare_key(headline)
+    for idx, line in enumerate(lines):
+        if not line:
+            continue
+        if looks_like_summary_noise(line):
+            continue
+        if BYLINE_RE.match(line):
+            continue
+        if re.match(r"^~?\d+\s*(minutes?|mins?)$", line.lower()):
+            continue
+        if normalize_compare_key(line) == headline_key:
+            continue
+        if len(line) < 45:
+            continue
+        combined = line
+        if not re.search(r"[.!?]$", combined):
+            for look_ahead in range(idx + 1, min(idx + 3, len(lines))):
+                nxt = lines[look_ahead]
+                if not nxt or looks_like_summary_noise(nxt):
+                    continue
+                if BYLINE_RE.match(nxt):
+                    continue
+                if len(nxt) < 20:
+                    continue
+                combined = f"{combined} {nxt}".strip()
+                if re.search(r"[.!?]", combined):
+                    break
+        sentence = first_sentence(combined)
+        if 40 <= len(sentence) <= 340:
             return sentence
     return ""
 
@@ -487,16 +785,23 @@ def outlet_from_url(url: str) -> str:
 
 def extract_recommendations(issue: Issue, html_text: str) -> list[dict[str, str]]:
     headings = parse_headings(html_text)
+    images = parse_images(html_text)
     items: list[dict[str, str]] = []
     seen_keys: set[tuple[str, str, str, str]] = set()
 
-    def add_item(headline: str, writer: str, outlet: str, summary: str, story_url: str, source: str) -> None:
+    def add_item(
+        headline: str,
+        writer: str,
+        outlet: str,
+        summary: str,
+        story_url: str,
+        source: str,
+        lead_image: str = "",
+    ) -> None:
         headline = normalize_headline(headline)
         writer = writer.strip()
         outlet = outlet.strip()
         summary = first_sentence(summary)
-        if not summary:
-            summary = f"Recommended in {issue.title}."
         if not outlet:
             outlet = outlet_from_url(story_url)
         if not passes_quality_checks(headline, outlet, writer, summary):
@@ -517,6 +822,7 @@ def extract_recommendations(issue: Issue, html_text: str) -> list[dict[str, str]
                 "topic": topic,
                 "summary": summary,
                 "url": story_url or issue.url,
+                "leadImage": lead_image,
                 "sourceFormat": source,
             }
         )
@@ -539,8 +845,9 @@ def extract_recommendations(issue: Issue, html_text: str) -> list[dict[str, str]
             writer = by_in_title.group(1).strip()
             title = re.sub(r",\s*by\s+.+$", "", title, flags=re.IGNORECASE).strip()
 
+        next_h1 = next((idx for idx in range(i + 1, len(headings)) if headings[idx]["level"] == "1"), len(headings))
         next_idx = i + 1
-        for j in range(i + 1, min(i + 5, len(headings))):
+        for j in range(i + 1, min(i + 6, next_h1)):
             next_text = headings[j]["text"]
             parsed_writer, parsed_outlet = parse_byline_text(next_text)
             if parsed_writer:
@@ -559,8 +866,17 @@ def extract_recommendations(issue: Issue, html_text: str) -> list[dict[str, str]
                 next_idx = j + 1
                 break
 
-        summary = summary_from_nearby(headings, next_idx)
-        add_item(title, writer, outlet, summary, story_url, "h1-sequence")
+        summary = summary_from_nearby(headings, next_idx, next_h1)
+        if not summary:
+            block_start = int(h["end"])
+            block_end = int(headings[next_h1]["start"]) if next_h1 < len(headings) else len(html_text)
+            summary = summary_from_block(html_text[block_start:block_end], title)
+
+        previous_h1 = next((idx for idx in range(i - 1, -1, -1) if headings[idx]["level"] == "1"), -1)
+        previous_start = int(headings[previous_h1]["start"]) if previous_h1 >= 0 else 0
+        lead_image = choose_story_image(images, previous_start, int(h["start"]))
+
+        add_item(title, writer, outlet, summary, story_url, "h1-sequence", lead_image)
 
     # Older template pass: one line often contains title + byline + source.
     for i, h in enumerate(headings):
@@ -576,7 +892,8 @@ def extract_recommendations(issue: Issue, html_text: str) -> list[dict[str, str]
         if len(minute_split) == 2 and minute_split[1].strip():
             summary = minute_split[1].strip()
         if not summary:
-            summary = summary_from_nearby(headings, i + 1)
+            next_h1 = next((idx for idx in range(i + 1, len(headings)) if headings[idx]["level"] == "1"), len(headings))
+            summary = summary_from_nearby(headings, i + 1, next_h1)
         add_item(title, writer, outlet, summary, story_url, "inline-byline")
 
     # Legacy template fallback for early issues using numbered plain-text blocks.
@@ -589,12 +906,21 @@ def extract_recommendations(issue: Issue, html_text: str) -> list[dict[str, str]
                 legacy["summary"],
                 legacy["url"],
                 "legacy-numbered",
+                "",
             )
 
     return items
 
 
-def run(docx_path: Path, output_path: Path, cache_dir: Path | None) -> None:
+def run(
+    docx_path: Path,
+    output_path: Path,
+    cache_dir: Path | None,
+    lead_image_source: str,
+    article_image_cache: Path | None,
+    article_image_workers: int,
+    article_image_timeout: float,
+) -> None:
     issues = parse_docx_issues(docx_path)
     all_items: list[dict[str, str]] = []
     failed: list[str] = []
@@ -608,6 +934,22 @@ def run(docx_path: Path, output_path: Path, cache_dir: Path | None) -> None:
         except Exception as exc:  # noqa: BLE001
             failed.append(f"{issue.date} {issue.url} :: {exc}")
             print(f"[{idx:03d}/{len(issues)}] FAILED {issue.url} :: {exc}")
+
+    if lead_image_source == "article":
+        default_cache = (cache_dir / "article-image-cache.json") if cache_dir else (
+            output_path.parent / ".cache" / "article-image-cache.json"
+        )
+        cache_file = article_image_cache or default_cache
+        with_image, resolved = enrich_with_article_images(
+            all_items,
+            cache_file=cache_file,
+            workers=article_image_workers,
+            timeout=article_image_timeout,
+        )
+        print(f"Article image matches: {with_image}/{len(all_items)} items ({resolved} unique URLs)")
+    elif lead_image_source == "none":
+        for item in all_items:
+            item["leadImage"] = ""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(all_items, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -626,9 +968,41 @@ def main() -> None:
     parser.add_argument("--docx", type=Path, required=True, help="Path to the SLR archive DOCX.")
     parser.add_argument("--output", type=Path, required=True, help="Path to output JSON.")
     parser.add_argument("--cache-dir", type=Path, default=None, help="Optional cache directory for downloaded issue HTML.")
+    parser.add_argument(
+        "--lead-image-source",
+        choices=("article", "newsletter", "none"),
+        default="article",
+        help="Where to pull lead images from: linked article metadata, newsletter layout, or none.",
+    )
+    parser.add_argument(
+        "--article-image-cache",
+        type=Path,
+        default=None,
+        help="Optional path to article image cache JSON file (used with --lead-image-source article).",
+    )
+    parser.add_argument(
+        "--article-image-workers",
+        type=int,
+        default=12,
+        help="Concurrent worker count for article image lookups.",
+    )
+    parser.add_argument(
+        "--article-image-timeout",
+        type=float,
+        default=12.0,
+        help="Timeout in seconds for each article image lookup request.",
+    )
     args = parser.parse_args()
 
-    run(args.docx, args.output, args.cache_dir)
+    run(
+        args.docx,
+        args.output,
+        args.cache_dir,
+        args.lead_image_source,
+        args.article_image_cache,
+        args.article_image_workers,
+        args.article_image_timeout,
+    )
 
 
 if __name__ == "__main__":
