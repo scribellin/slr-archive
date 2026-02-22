@@ -247,6 +247,10 @@ h1 {
   margin: 0;
 }
 
+.issue {
+  display: none !important;
+}
+
 .title {
   margin: 0;
   font-family: "Newsreader", Georgia, serif;
